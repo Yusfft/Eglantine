@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <cmath>
+#include <cstring>
+#include <string>
 
 #include "common/common_types.h"
 #include "common/logging.h"
@@ -16,6 +19,9 @@
 #include "core/hle/service/hid/active_vibration_device_list.h"
 #include "core/hle/service/hid/applet_resource.h"
 #include "core/hle/service/hid/hid_server.h"
+#include "core/core.h"
+#include "hid_core/frontend/emulated_controller.h"
+#include "hid_core/hid_core.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/memory.h"
 #include "hid_core/hid_result.h"
@@ -132,7 +138,7 @@ IHidServer::IHidServer(Core::System& system_, std::shared_ptr<ResourceManager> r
         {210, C<&IHidServer::EndPermitVibrationSession>, "EndPermitVibrationSession"},
         {211, C<&IHidServer::IsVibrationDeviceMounted>, "IsVibrationDeviceMounted"},
         {212, C<&IHidServer::SendVibrationValueInBool>, "SendVibrationValueInBool"},
-        {214, C<&IHidServer::SendNx2VibrationValues>, "SendNx2VibrationValues (guessed)"},
+        {214, &IHidServer::SendNx2VibrationValues, "SendNx2VibrationValues (guessed)"},
         {300, C<&IHidServer::ActivateConsoleSixAxisSensor>, "ActivateConsoleSixAxisSensor"},
         {301, C<&IHidServer::StartConsoleSixAxisSensor>, "StartConsoleSixAxisSensor"},
         {302, C<&IHidServer::StopConsoleSixAxisSensor>, "StopConsoleSixAxisSensor"},
@@ -1070,9 +1076,98 @@ Result IHidServer::IsVibrationDeviceMounted(
     R_SUCCEED();
 }
 
-Result IHidServer::SendNx2VibrationValues() {
-    LOG_DEBUG(Service_HID, "(STUBBED) called");
-    R_SUCCEED();
+// Switch 2 games send vibration with 214 instead of 206. Like 206 it carries two HIPC pointer
+// (X) buffers: the vibration device handles and one value per handle. The value layout of
+// Switch 2 controllers is not documented, so each element's leading nn::hid::VibrationValue
+// (low amp, low freq, high amp, high freq as f32) is used when it is plausible, and the value is
+// sent straight to the host controller: Switch 2 titles do not always initialize the vibration
+// devices through the Switch 1 path, which made the regular 206 route drop every value.
+// The request layout is logged (only when it changes) so an unexpected format can be fixed.
+void IHidServer::SendNx2VibrationValues(HLERequestContext& ctx) {
+    static std::string last_layout;
+
+    const std::size_t num_x = ctx.BufferDescriptorX().size();
+    const auto log_layout = [&](std::string_view note) {
+        std::string layout = fmt::format("X={} A={} {}", num_x, ctx.BufferDescriptorA().size(), note);
+        for (std::size_t i = 0; i < num_x; ++i) {
+            const auto data = ctx.ReadBufferX(i);
+            layout += fmt::format(" | X{} size={}:", i, data.size());
+            for (std::size_t b = 0; b < std::min<std::size_t>(data.size(), 64); ++b) {
+                layout += fmt::format("{}{:02x}", b % 4 == 0 ? " " : "", data[b]);
+            }
+        }
+        if (layout != last_layout) {
+            LOG_INFO(Service_HID, "214 layout: {}", layout);
+            last_layout = std::move(layout);
+        }
+    };
+
+    IPC::ResponseBuilder rb{ctx, 2};
+    rb.Push(ResultSuccess);
+
+    if (num_x < 2) {
+        log_layout("(expected 2 X buffers)");
+        return;
+    }
+
+    const auto handle_data = ctx.ReadBufferX(0);
+    const auto value_data = ctx.ReadBufferX(1);
+    const std::size_t count = handle_data.size() / sizeof(Core::HID::VibrationDeviceHandle);
+    if (count == 0 || value_data.size() < count * sizeof(Core::HID::VibrationValue)) {
+        log_layout("(unexpected sizes)");
+        return;
+    }
+    const std::size_t stride = value_data.size() / count;
+
+    const auto plausible = [](const Core::HID::VibrationValue& v) {
+        const auto amp_ok = [](f32 a) { return std::isfinite(a) && a >= 0.0f && a <= 1.5f; };
+        const auto freq_ok = [](f32 f) { return std::isfinite(f) && f >= 0.0f && f <= 4000.0f; };
+        return amp_ok(v.low_amplitude) && amp_ok(v.high_amplitude) &&
+               freq_ok(v.low_frequency) && freq_ok(v.high_frequency);
+    };
+
+    f32 master_volume = 1.0f;
+    if (GetResourceManager()->GetNpad()->GetVibrationHandler()->GetVibrationMasterVolume(
+            master_volume)
+            .IsError()) {
+        master_volume = 1.0f;
+    }
+
+    bool all_plausible = true;
+    for (std::size_t i = 0; i < count; ++i) {
+        Core::HID::VibrationDeviceHandle handle{};
+        std::memcpy(&handle, handle_data.data() + i * sizeof(handle), sizeof(handle));
+        Core::HID::VibrationValue value{};
+        std::memcpy(&value, value_data.data() + i * stride, sizeof(value));
+
+        if (!plausible(value)) {
+            all_plausible = false;
+            continue;
+        }
+        const auto npad_id = static_cast<Core::HID::NpadIdType>(handle.npad_id);
+        if (!IsNpadIdValid(npad_id)) {
+            all_plausible = false;
+            continue;
+        }
+        auto* controller = system.HIDCore().GetEmulatedController(npad_id);
+        if (controller == nullptr) {
+            continue;
+        }
+
+        value.low_amplitude *= master_volume;
+        value.high_amplitude *= master_volume;
+        if (handle.device_index == Core::HID::DeviceIndex::Left ||
+            handle.device_index == Core::HID::DeviceIndex::Right) {
+            controller->SetVibration(handle.device_index, value);
+        } else {
+            controller->SetVibration(Core::HID::DeviceIndex::Left, value);
+            controller->SetVibration(Core::HID::DeviceIndex::Right, value);
+        }
+    }
+
+    if (!all_plausible || stride != sizeof(Core::HID::VibrationValue)) {
+        log_layout(fmt::format("(count={} stride={} plausible={})", count, stride, all_plausible));
+    }
 }
 
 Result IHidServer::SendVibrationValueInBool(
